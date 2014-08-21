@@ -61,3 +61,6 @@ benchmarks.db
 
 # iPython notebooks
 *.ipynb
+
+# Pycharm
+.idea/
