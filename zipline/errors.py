@@ -159,3 +159,14 @@ class TradingControlViolation(ZiplineError):
     msg = """
 Order for {amount} shares of {sid} violates trading constraint {constraint}.
 """.strip()
+
+
+class IncompatibleHistoryFrequency(ZiplineError):
+    """
+    Raised when a frequency is given to history which is not supported.
+    At least, not yet.
+    """
+    msg = """
+Requested history at frequency '{frequency}' cannot be created with data
+at frequency '{data_frequency}'.
+""".strip()
