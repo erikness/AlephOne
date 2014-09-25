@@ -1,125 +1,39 @@
 # Methods for transforming raw mongo data into a data source in a zipline appropriate format
 
-from datetime import *
+import pandas as pd
+import pymongo as pm
 import pytz
-from zipline.gens.utils import hash_args
-from zipline.sources.data_source import DataSource
 from collections import defaultdict
+from datetime import *
+from itertools import chain
+import numpy as np
 
-def _int_or_none(x):
-    """
-    Alternative to the int() function;
-    :param x: either a number or None
-    :return: int(x), or None in case x is None
-    """
-    return None if x is None else int(x)
+db = pm.MongoClient("192.168.0.140:27017").futures_data
+get_cursor = lambda und: db.FuturesData.find({'underlying': und}, {'_id': 0}).sort([('ten_minute_timestamp', 1)])
 
+def kill_nulls(val, default):
+    if val is None or np.isnan(val):
+        return default
+    else:
+        return val
 
-
-
-
-
-
-
-
-def _irregular_interval_source(record_list, start_time=datetime(2010, 1, 1, 0, 0),
-                    end_time=datetime(2011, 1, 1, 0, 0)):
-    """Generate at the irregular intervals that we have data at;
-    i.e. if we have data at 2:02, 2:03, and 2:17, that is when our bars will say they came in.
-    No aggregation, one bar per transaction."""
-    for ten_minute_record in record_list:
-        for contract in ten_minute_record['contracts']:
-            for info in contract['data']:
-                info['timestamp'] = info['timestamp'].replace(tzinfo=pytz.UTC)
-                # info has oi, price, timestamp, size,
-                # generator returns dt, price, sid, volume
-                yield {'dt': info['timestamp'],
-                        'price': info['price'],
-                        'open_interest': info['open_interest'],
-                        'sid': ten_minute_record['underlying'] + contract['expiration'],
-                        'volume': info['size']}
-
-# irr_gen = irregular_interval_source(mock_db)
+def get_ten_minute(dt):
+    return dt.replace(minute=dt.minute - dt.minute % 10, second=0, microsecond=0)
 
 
+def data_panel(underlyings, start_time=datetime(2010, 1, 1, 0, 0, tzinfo=pytz.UTC),
+               end_time=datetime(2011, 1, 1, 0, 0, tzinfo=pytz.UTC), intv=timedelta(hours=1)):
+    # It would be ideal if we could iterate through data timestamp first and underlying second, but the index
+    # in mongo is the other way around, so we're going to have to get each individually and clump them together
+    # at the end
+    def make_cursor(und):
+        return db.FuturesData.find({'underlying': und}, {'_id': 0}).sort([('underlying', 1), ('ten_minute_timestamp', 1)])
 
-def _regular_interval_source(record_list, start_time=datetime(2010, 1, 1, 0, 0),
-                    end_time=datetime(2011, 1, 1, 0, 0), intv=timedelta(hours=1)):
-    """Generate at a regular interval, aggregating volume between bars
-    and always showing the last price between bars."""
-    cur_time = start_time
-    aggregated_volume = 0
-    last_price = 0
-    last_open_interest = 0
+    panels = [raw_panel(make_cursor(und), start_time, end_time, intv) for und in underlyings]
+    combined_panel = pd.Panel.from_dict({symbol: df for symbol, df in chain(*[p.iteritems() for p in panels])})
+    return combined_panel
 
-    for ten_minute_record in record_list:
-        for contract in ten_minute_record['contracts']:
-            for info in contract['data']:
-                info['timestamp'] = info['timestamp'].replace(tzinfo=pytz.UTC)
-                if info['timestamp'] >= cur_time + intv:
-                    yield {'dt': cur_time + intv,
-                           'price': last_price,
-                           'open_interest': last_open_interest,
-                           'sid': ten_minute_record['underlying'] + contract['expiration'],
-                           'volume': aggregated_volume}
-                    aggregated_volume = 0
-                    cur_time += intv
-                    while cur_time + intv < info['timestamp']:
-                        yield {'dt': cur_time + intv,
-                               'price': last_price,
-                               'open_interest': last_open_interest,
-                               'sid': ten_minute_record['underlying'] + contract['expiration'],
-                               'volume': 0}
-                        cur_time += intv
-                aggregated_volume += info['size'] or 0
-                last_price = info['price'] or last_price
-                last_open_interest = info['open_interest']
-
-#hour_gen = regular_interval_source(mock_db)
-
-class AbstractIntervalSource(DataSource):
-    @property
-    def mapping(self):
-        return {
-            'dt': (lambda x: x, 'dt'),
-            'sid': (lambda x: x.strip(), 'sid'),
-            'price': (float, 'price'),
-            'volume': (int, 'volume'),
-            'open_interest': (_int_or_none, 'open_interest'),
-        }
-
-    @property
-    def instance_hash(self):
-        return self.arg_hash
-
-    @property
-    def raw_data(self):
-        if not self._raw_data:
-            self._raw_data = self.raw_data_gen()
-        return self._raw_data
-
-    def raw_data_gen(self):
-        return self.gen
-
-class IrregularIntervalSource(AbstractIntervalSource):
-    def __init__(self, record_list, start_time, end_time):
-        self.gen = _irregular_interval_source(record_list, start_time, end_time)
-        self.start = start_time
-        self.end = end_time
-        self.arg_hash = hash_args(record_list, start_time, end_time)
-        self._raw_data = None
-
-class RegularIntervalSource(AbstractIntervalSource):
-    def __init__(self, record_list, start_time,
-                 end_time, intv=timedelta(hours=1)):
-        self.gen = _regular_interval_source(record_list, start_time, end_time, intv)
-        self.start = start_time
-        self.end = end_time
-        self.arg_hash = hash_args(record_list, start_time, end_time)
-        self._raw_data = None
-
-def regular_interval_panel(record_list, start_time=datetime(2010, 1, 1, 0, 0, tzinfo=pytz.UTC),
-                    end_time=datetime(2011, 1, 1, 0, 0, tzinfo=pytz.UTC), intv=timedelta(hours=1)):
+def raw_panel(record_list, start_time, end_time, intv):
     """Generate at a regular interval, aggregating volume between bars
     and always showing the last price between bars."""
     cur_time = start_time
@@ -131,30 +45,65 @@ def regular_interval_panel(record_list, start_time=datetime(2010, 1, 1, 0, 0, tz
     records = defaultdict(list)
 
     for ten_minute_record in record_list:
+        und = ten_minute_record['underlying']
         for contract in ten_minute_record['contracts']:
             for info in contract['data']:
                 info['timestamp'] = info['timestamp'].replace(tzinfo=pytz.UTC)
                 if info['timestamp'] >= cur_time + intv:
-                    month_code = contract['expiration']
-                    indexes[month_code].append(cur_time + intv)
-                    records[month_code].append({
+                    symbol = und + "." + contract['expiration'].strip()
+                    indexes[symbol].append(cur_time + intv)
+                    records[symbol].append({
                            'price': last_price,
                            'open_interest': last_open_interest,
                            'volume': aggregated_volume})
                     aggregated_volume = 0
                     cur_time += intv
                     while cur_time + intv < info['timestamp']:
-                        month_code = contract['expiration']
-                        indexes[month_code].append(cur_time + intv)
-                        records[month_code].append({
+                        indexes[symbol].append(cur_time + intv)
+                        records[symbol].append({
                                'price': last_price,
                                'open_interest': last_open_interest,
                                'volume': 0})
                         cur_time += intv
-                aggregated_volume += info['size'] or 0
+                aggregated_volume += kill_nulls(info['size'], 0)
                 last_price = info['price'] or last_price
                 last_open_interest = info['open_interest']
 
     return pd.Panel.from_dict(
-        {month_code: pd.DataFrame.from_records(records[month_code], index=indexes[month_code])
-         for month_code in records.keys()})
+        {symbol: pd.DataFrame.from_records(records[symbol], index=indexes[symbol])
+         for symbol in records.keys()})
+
+def fill_nans(panel):
+    # How ought we fill the NaNs?
+    # For price, we forward fill all we can from the data we have;
+    #   if there are still NaN values at the front, we attempt to forward fill by grabbing the
+    #   most recent price from mongo; if there's no previous price before our records started
+    #   (i.e. the asset started trading after our simulation start date), then we keep NaNs.
+    # For volume, it makes sense to assume that if there were no trades during a certain time,
+    #   then volume is 0! Simply replace NaN values by 0.
+    # For open_interest: leave it alone for now. It can be NaN. In the future, NaN represents "I have
+    #   no data, it could be anything" (0 implies that no one wanted to trade the asset, and the accuracy
+    #   of forward filling is VERY rough around the edges, almost unusably so).
+
+    for symbol, frame in panel.iteritems():
+        und, month_code = symbol.split('.')
+        # volume
+        frame['volume'] = frame['volume'].replace(np.nan, 0)
+        # price
+        frame['price'] = frame['price'].ffill()
+        if np.isnan(frame.ix[0]['price']):
+            earliest_dt = frame.index[0]
+            cur = db.FuturesData.find({'underlying': und, 'ten_minute_timestamp': {'$lte': earliest_dt}},
+                                      {'_id': 0}).sort([('ten_minute_timestamp', -1)])
+            precursor_price = float("nan")
+            for result in cur:
+                entry_list = [x for x in result['contracts'] if x['expiration'].strip() == month_code][0]
+                for entry in reversed(entry_list):
+                    if entry['timestamp'] <= earliest_dt:
+                        if entry['price'] is not None:
+                            precursor_price = entry['price']
+                            break
+                if not np.isnan(precursor_price):
+                    break
+            frame.ix[0]['price'] = precursor_price
+            frame['price'] = frame['price'].ffill()
