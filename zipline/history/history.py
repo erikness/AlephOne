@@ -258,7 +258,8 @@ class HistorySpec(object):
         self.frequency = frequency
         # The field, e.g. 'price', 'volume', etc.
         self.field = field
-        # Whether or not to forward fill the nan data.
+        # Whether or not to forward fill nan data.  Only has an effect if this
+        # spec's field is in FORWARD_FILLABLE.
         self._ffill = ffill
 
         # Calculate the cache key string once.
@@ -320,8 +321,8 @@ def index_at_dt(history_spec, algo_dt):
     Returns index of a frame returned by get_history() with the given
     history_spec and algo_dt.
 
-    The resulting index `@history_spec.bar_count` bars, increasing in units of
-    `@history_spec.frequency`, terminating at the given @algo_dt.
+    The resulting index will have @history_spec.bar_count bars, increasing in
+    units of @history_spec.frequency, terminating at the given @algo_dt.
 
     Note: The last bar of the returned frame represents an as-of-yet incomplete
     time window, so the delta between the last and second-to-last bars is
