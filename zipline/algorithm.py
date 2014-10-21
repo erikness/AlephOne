@@ -34,6 +34,7 @@ from zipline.errors import (
     UnsupportedCommissionModel,
     UnsupportedOrderParameters,
     UnsupportedSlippageModel,
+    IncompatibleScheduleFunctionDataFrequency,
 )
 
 from zipline.finance import trading
@@ -65,6 +66,13 @@ from zipline.gens.tradesimulation import AlgorithmSimulator
 from zipline.sources import DataFrameSource, DataPanelSource
 from zipline.transforms.utils import StatefulTransform
 from zipline.utils.api_support import ZiplineAPI, api_method
+import zipline.utils.events
+from zipline.utils.events import (
+    EventManager,
+    make_eventrule,
+    DateRuleFactory,
+    TimeRuleFactory,
+)
 from zipline.utils.factory import create_simulation_parameters
 
 import zipline.protocol
@@ -168,7 +176,10 @@ class TradingAlgorithm(object):
             self.blotter = Blotter()
 
         self.portfolio_needs_update = True
+        self.account_needs_update = True
+        self.performance_needs_update = True
         self._portfolio = None
+        self._account = None
 
         self.history_container = None
         self.history_specs = {}
@@ -180,6 +191,8 @@ class TradingAlgorithm(object):
         self._initialize = None
         self._before_trading_start = None
         self._analyze = None
+
+        self.event_manager = EventManager()
 
         if self.algoscript is not None:
             exec_(self.algoscript, self.namespace)
@@ -202,6 +215,16 @@ class TradingAlgorithm(object):
             self._handle_data = kwargs.pop('handle_data')
             self._before_trading_start = kwargs.pop('before_trading_start',
                                                     None)
+
+        self.event_manager.add_event(
+            zipline.utils.events.Event(
+                zipline.utils.events.Always(),
+                # We pass handle_data.__func__ to get the unbound method.
+                # We will explicitly pass the algorithm to bind it again.
+                self.handle_data.__func__,
+            ),
+            prepend=True,
+        )
 
         # If method not defined, NOOP
         if self._initialize is None:
@@ -336,6 +359,8 @@ class TradingAlgorithm(object):
             self.perf_tracker = PerformanceTracker(sim_params)
 
         self.portfolio_needs_update = True
+        self.account_needs_update = True
+        self.performance_needs_update = True
 
         self.data_gen = self._create_data_generator(source_filter, sim_params)
 
@@ -491,6 +516,34 @@ class TradingAlgorithm(object):
     @api_method
     def get_environment(self):
         return self._environment
+
+    def add_event(self, rule=None, callback=None):
+        """
+        Adds an event to the algorithm's EventManager.
+        """
+        self.event_manager.add_event(
+            zipline.utils.events.Event(rule, callback),
+        )
+
+    @api_method
+    def schedule_function(self,
+                          func,
+                          date_rule=None,
+                          time_rule=None,
+                          half_days=True):
+        """
+        Schedules a function to be called with some timed rules.
+        """
+        if self.sim_params.data_frequency != 'minute':
+            raise IncompatibleScheduleFunctionDataFrequency()
+
+        date_rule = date_rule or DateRuleFactory.every_day()
+        time_rule = time_rule or TimeRuleFactory.market_open()
+
+        self.add_event(
+            make_eventrule(date_rule, time_rule, half_days),
+            func,
+        )
 
     @api_method
     def record(self, *args, **kwargs):
@@ -653,9 +706,23 @@ class TradingAlgorithm(object):
 
     def updated_portfolio(self):
         if self.portfolio_needs_update:
-            self._portfolio = self.perf_tracker.get_portfolio()
+            self._portfolio = \
+                self.perf_tracker.get_portfolio(self.performance_needs_update)
             self.portfolio_needs_update = False
+            self.performance_needs_update = False
         return self._portfolio
+
+    @property
+    def account(self):
+        return self.updated_account()
+
+    def updated_account(self):
+        if self.account_needs_update:
+            self._account = \
+                self.perf_tracker.get_account(self.performance_needs_update)
+            self.account_needs_update = False
+            self.performance_needs_update = False
+        return self._account
 
     def set_logger(self, logger):
         self.logger = logger
