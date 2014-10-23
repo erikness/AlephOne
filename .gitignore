@@ -64,3 +64,6 @@ benchmarks.db
 
 # Pycharm
 .idea/
+
+# DB config file - this will be different for every machine
+dbconfig.py
