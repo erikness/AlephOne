@@ -1,14 +1,15 @@
 # Methods for transforming raw mongo data into a data source in a zipline appropriate format
+# How to use:
 
 import pandas as pd
-import pymongo as pm
 import pytz
 from collections import defaultdict
 from datetime import *
 from itertools import chain
 import numpy as np
+import dbconfig
 
-db = pm.MongoClient("192.168.0.140:27017").futures_data
+db = dbconfig.new_connection()
 get_cursor = lambda und: db.FuturesData.find({'underlying': und}, {'_id': 0}).sort([('ten_minute_timestamp', 1)])
 
 def kill_nulls(val, default):
@@ -27,18 +28,20 @@ def data_panel(underlyings, start_time=datetime(2010, 1, 1, 0, 0, tzinfo=pytz.UT
     # in mongo is the other way around, so we're going to have to get each individually and clump them together
     # at the end
     def make_cursor(und):
-        return db.FuturesData.find({'underlying': und}, {'_id': 0}).sort([('underlying', 1), ('ten_minute_timestamp', 1)])
+        return db.FuturesData.find({'underlying': und, 'ten_minute_timestamp': {'$gte': start_time, '$lte': end_time}}, {'_id': 0}
+            ).sort([('underlying', 1), ('ten_minute_timestamp', 1)])
 
     panels = [raw_panel(make_cursor(und), start_time, end_time, intv) for und in underlyings]
     combined_panel = pd.Panel.from_dict({symbol: df for symbol, df in chain(*[p.iteritems() for p in panels])})
+    fill_nans(combined_panel)  # We might want to add this as an optional parameter
     return combined_panel
 
 def raw_panel(record_list, start_time, end_time, intv):
     """Generate at a regular interval, aggregating volume between bars
     and always showing the last price between bars."""
     cur_time = start_time
-    aggregated_volume = 0
-    last_price = 0
+    aggregated_volumes = defaultdict(lambda: 0)
+    last_prices = defaultdict(lambda: float("nan"))
     last_open_interest = 0
 
     indexes = defaultdict(list)
@@ -49,24 +52,24 @@ def raw_panel(record_list, start_time, end_time, intv):
         for contract in ten_minute_record['contracts']:
             for info in contract['data']:
                 info['timestamp'] = info['timestamp'].replace(tzinfo=pytz.UTC)
+                symbol = und + "." + contract['expiration'].strip()
                 if info['timestamp'] >= cur_time + intv:
-                    symbol = und + "." + contract['expiration'].strip()
                     indexes[symbol].append(cur_time + intv)
                     records[symbol].append({
-                           'price': last_price,
+                           'price': last_prices[symbol],
                            'open_interest': last_open_interest,
-                           'volume': aggregated_volume})
-                    aggregated_volume = 0
+                           'volume': aggregated_volumes[symbol]})
+                    aggregated_volumes[symbol] = 0
                     cur_time += intv
                     while cur_time + intv < info['timestamp']:
                         indexes[symbol].append(cur_time + intv)
                         records[symbol].append({
-                               'price': last_price,
+                               'price': last_prices[symbol],
                                'open_interest': last_open_interest,
                                'volume': 0})
                         cur_time += intv
-                aggregated_volume += kill_nulls(info['size'], 0)
-                last_price = info['price'] or last_price
+                aggregated_volumes[symbol] += kill_nulls(info['size'], 0)
+                last_prices[symbol] = info['price'] or last_prices[symbol]
                 last_open_interest = info['open_interest']
 
     return pd.Panel.from_dict(
@@ -88,7 +91,7 @@ def fill_nans(panel):
     for symbol, frame in panel.iteritems():
         und, month_code = symbol.split('.')
         # volume
-        frame['volume'] = frame['volume'].replace(np.nan, 0)
+        frame['volume'] = frame['volume'].replace(nan, 0)
         # price
         frame['price'] = frame['price'].ffill()
         if np.isnan(frame.ix[0]['price']):
@@ -97,13 +100,18 @@ def fill_nans(panel):
                                       {'_id': 0}).sort([('ten_minute_timestamp', -1)])
             precursor_price = float("nan")
             for result in cur:
-                entry_list = [x for x in result['contracts'] if x['expiration'].strip() == month_code][0]
+                try:
+                    entry_list = [x for x in result['contracts'] if x['expiration'].strip() == month_code][0]['data']
+                except IndexError:
+                    entry_list = []
                 for entry in reversed(entry_list):
+                    entry['timestamp'] = entry['timestamp'].replace(tzinfo=pytz.UTC)
                     if entry['timestamp'] <= earliest_dt:
                         if entry['price'] is not None:
+                            #print "Let it be known that something changed at
                             precursor_price = entry['price']
                             break
                 if not np.isnan(precursor_price):
                     break
-            frame.ix[0]['price'] = precursor_price
+            frame.loc[earliest_dt, "price"] = precursor_price
             frame['price'] = frame['price'].ffill()
