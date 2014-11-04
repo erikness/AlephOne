@@ -34,6 +34,7 @@ from zipline.errors import (
     UnsupportedCommissionModel,
     UnsupportedOrderParameters,
     UnsupportedSlippageModel,
+    IncompatibleScheduleFunctionDataFrequency,
 )
 
 from zipline.finance import trading
@@ -65,6 +66,13 @@ from zipline.gens.tradesimulation import AlgorithmSimulator
 from zipline.sources import DataFrameSource, DataPanelSource
 from zipline.transforms.utils import StatefulTransform
 from zipline.utils.api_support import ZiplineAPI, api_method
+import zipline.utils.events
+from zipline.utils.events import (
+    EventManager,
+    make_eventrule,
+    DateRuleFactory,
+    TimeRuleFactory,
+)
 from zipline.utils.factory import create_simulation_parameters
 
 import zipline.protocol
@@ -168,8 +176,14 @@ class TradingAlgorithm(object):
             self.blotter = Blotter()
 
         self.portfolio_needs_update = True
+        self.account_needs_update = True
+        self.performance_needs_update = True
         self._portfolio = None
+        self._account = None
 
+        self.history_container_class = kwargs.pop(
+            'history_container_class', HistoryContainer,
+        )
         self.history_container = None
         self.history_specs = {}
 
@@ -180,6 +194,8 @@ class TradingAlgorithm(object):
         self._initialize = None
         self._before_trading_start = None
         self._analyze = None
+
+        self.event_manager = EventManager()
 
         if self.algoscript is not None:
             exec_(self.algoscript, self.namespace)
@@ -202,6 +218,16 @@ class TradingAlgorithm(object):
             self._handle_data = kwargs.pop('handle_data')
             self._before_trading_start = kwargs.pop('before_trading_start',
                                                     None)
+
+        self.event_manager.add_event(
+            zipline.utils.events.Event(
+                zipline.utils.events.Always(),
+                # We pass handle_data.__func__ to get the unbound method.
+                # We will explicitly pass the algorithm to bind it again.
+                self.handle_data.__func__,
+            ),
+            prepend=True,
+        )
 
         # If method not defined, NOOP
         if self._initialize is None:
@@ -298,7 +324,8 @@ class TradingAlgorithm(object):
                        'returns': ret,
                        'type': zipline.protocol.DATASOURCE_TYPE.BENCHMARK,
                        'source_id': 'benchmarks'})
-                for dt, ret in trading.environment.benchmark_returns.iterkv()
+                for dt, ret in
+                trading.environment.benchmark_returns.iteritems()
                 if dt.date() >= sim_params.period_start.date()
                 and dt.date() <= sim_params.period_end.date()
             ]
@@ -330,9 +357,14 @@ class TradingAlgorithm(object):
         processed by the zipline, and False for those that should be
         skipped.
         """
-        # Instantiate perf_tracker
-        self.perf_tracker = PerformanceTracker(sim_params)
+        if self.perf_tracker is None:
+            # HACK: When running with the `run` method, we set perf_tracker to
+            # None so that it will be overwritten here.
+            self.perf_tracker = PerformanceTracker(sim_params)
+
         self.portfolio_needs_update = True
+        self.account_needs_update = True
+        self.performance_needs_update = True
 
         self.data_gen = self._create_data_generator(source_filter, sim_params)
 
@@ -406,11 +438,13 @@ class TradingAlgorithm(object):
             self.sim_params._update_internal()
 
         # Create history containers
-        if len(self.history_specs) != 0:
-            self.history_container = HistoryContainer(
+        if self.history_specs:
+            self.history_container = self.history_container_class(
                 self.history_specs,
                 self.sim_params.sids,
-                self.sim_params.first_open)
+                self.sim_params.first_open,
+                self.sim_params.data_frequency,
+            )
 
         # Create transforms by wrapping them into StatefulTransforms
         self.transforms = []
@@ -488,6 +522,34 @@ class TradingAlgorithm(object):
     @api_method
     def get_environment(self):
         return self._environment
+
+    def add_event(self, rule=None, callback=None):
+        """
+        Adds an event to the algorithm's EventManager.
+        """
+        self.event_manager.add_event(
+            zipline.utils.events.Event(rule, callback),
+        )
+
+    @api_method
+    def schedule_function(self,
+                          func,
+                          date_rule=None,
+                          time_rule=None,
+                          half_days=True):
+        """
+        Schedules a function to be called with some timed rules.
+        """
+        if self.sim_params.data_frequency != 'minute':
+            raise IncompatibleScheduleFunctionDataFrequency()
+
+        date_rule = date_rule or DateRuleFactory.every_day()
+        time_rule = time_rule or TimeRuleFactory.market_open()
+
+        self.add_event(
+            make_eventrule(date_rule, time_rule, half_days),
+            func,
+        )
 
     @api_method
     def record(self, *args, **kwargs):
@@ -650,9 +712,23 @@ class TradingAlgorithm(object):
 
     def updated_portfolio(self):
         if self.portfolio_needs_update:
-            self._portfolio = self.perf_tracker.get_portfolio()
+            self._portfolio = \
+                self.perf_tracker.get_portfolio(self.performance_needs_update)
             self.portfolio_needs_update = False
+            self.performance_needs_update = False
         return self._portfolio
+
+    @property
+    def account(self):
+        return self.updated_account()
+
+    def updated_account(self):
+        if self.account_needs_update:
+            self._account = \
+                self.perf_tracker.get_account(self.performance_needs_update)
+            self.account_needs_update = False
+            self.performance_needs_update = False
+        return self._account
 
     def set_logger(self, logger):
         self.logger = logger
@@ -675,13 +751,15 @@ class TradingAlgorithm(object):
         self.blotter.set_date(dt)
 
     @api_method
-    def get_datetime(self):
+    def get_datetime(self, tz=None):
         """
         Returns a copy of the datetime.
         """
         date_copy = copy(self.datetime)
         assert date_copy.tzinfo == pytz.utc, \
             "Algorithm should have a utc datetime"
+        if tz is not None:
+            date_copy = date_copy.tz_convert(tz)
         return date_copy
 
     def set_transact(self, transact):
@@ -839,21 +917,54 @@ class TradingAlgorithm(object):
         self.blotter.cancel(order_id)
 
     @api_method
-    def add_history(self, bar_count, frequency, field,
-                    ffill=True):
+    def add_history(self, bar_count, frequency, field, ffill=True):
         data_frequency = self.sim_params.data_frequency
-        daily_at_midnight = (data_frequency == 'daily')
-
         history_spec = HistorySpec(bar_count, frequency, field, ffill,
-                                   daily_at_midnight=daily_at_midnight,
                                    data_frequency=data_frequency)
         self.history_specs[history_spec.key_str] = history_spec
+        if self.initialized:
+            if self.history_container:
+                self.history_container.ensure_spec(history_spec, self.datetime)
+            else:
+                self.history_container = self.history_container_class(
+                    self.trade_sources.history_backfill,
+                    self.history_specs,
+                    self.multiverse.current_sids,
+                    self.sim_params.first_open,
+                    self.sim_params.data_frequency,
+                )
+
+    def get_history_spec(self, bar_count, frequency, field, ffill):
+        spec_key = HistorySpec.spec_key(bar_count, frequency, field, ffill)
+        if spec_key not in self.history_specs:
+            data_freq = self.sim_params.data_frequency
+            spec = HistorySpec(
+                bar_count,
+                frequency,
+                field,
+                ffill,
+                data_frequency=data_freq,
+            )
+            self.history_specs[spec_key] = spec
+            if not self.history_container:
+                self.history_container = self.history_container_class(
+                    self.history_specs,
+                    self.current_universe(),
+                    self.datetime,
+                    self.sim_params.data_frequency,
+                    shift_digest=True,
+                )
+            self.history_container.ensure_spec(spec, self.datetime)
+        return self.history_specs[spec_key]
 
     @api_method
     def history(self, bar_count, frequency, field, ffill=True):
-        spec_key_str = HistorySpec.spec_key(
-            bar_count, frequency, field, ffill)
-        history_spec = self.history_specs[spec_key_str]
+        history_spec = self.get_history_spec(
+            bar_count,
+            frequency,
+            field,
+            ffill,
+        )
         return self.history_container.get_history(history_spec, self.datetime)
 
     ####################
@@ -920,6 +1031,9 @@ class TradingAlgorithm(object):
         Set a rule specifying that this algorithm cannot take short positions.
         """
         self.register_trading_control(LongOnly())
+
+    def current_universe(self):
+        return self.sim_params.sids
 
     @classmethod
     def all_api_methods(cls):

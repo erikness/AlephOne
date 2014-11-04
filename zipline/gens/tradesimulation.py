@@ -177,6 +177,8 @@ class AlgorithmSimulator(object):
                             self._call_before_trading_start(next_day)
 
                     self.algo.portfolio_needs_update = True
+                    self.algo.account_needs_update = True
+                    self.algo.performance_needs_update = True
 
             risk_message = self.algo.perf_tracker.handle_simulation_end()
             yield risk_message
@@ -250,7 +252,11 @@ class AlgorithmSimulator(object):
         Call the user's handle_data, returning any orders placed by the algo
         during the call.
         """
-        self.algo.handle_data(self.current_data)
+        self.algo.event_manager.handle_data(
+            self.algo,
+            self.current_data,
+            self.simulation_dt,
+        )
         orders = self.algo.blotter.new_orders
         self.algo.blotter.new_orders = []
         return orders
@@ -273,6 +279,7 @@ class AlgorithmSimulator(object):
         # dt before we emit a perf message.  This is a no-op if
         # updated_portfolio has already been called this dt.
         self.algo.updated_portfolio()
+        self.algo.updated_account()
 
         rvars = self.algo.recorded_vars
         if self.algo.perf_tracker.emission_rate == 'daily':

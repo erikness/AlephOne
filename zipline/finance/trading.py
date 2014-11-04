@@ -16,9 +16,11 @@
 import bisect
 import logbook
 import datetime
+from functools import wraps
 
 import pandas as pd
 import numpy as np
+from six.moves import reduce
 
 from zipline.data.loader import load_market_data
 from zipline.utils import tradingcalendar
@@ -179,17 +181,37 @@ class TradingEnvironment(object):
         dt = self.normalize_date(test_date)
         delta = datetime.timedelta(days=-1)
 
-        while self.first_trading_day < test_date:
+        while self.first_trading_day < dt:
             dt += delta
             if dt in self.trading_days:
                 return dt
 
         return None
 
+    def add_trading_days(self, n, date):
+        if n > 0:
+            return reduce(
+                lambda a, b: self.next_trading_day(a),
+                range(n),
+                date,
+            )
+        else:
+            return reduce(
+                lambda a, b: self.previous_trading_day(a),
+                range(abs(n)),
+                date,
+            )
+
     def days_in_range(self, start, end):
         mask = ((self.trading_days >= start) &
                 (self.trading_days <= end))
         return self.trading_days[mask]
+
+    def opens_in_range(self, start, end):
+        return self.open_and_closes.market_open.loc[start:end]
+
+    def closes_in_range(self, start, end):
+        return self.open_and_closes.market_close.loc[start:end]
 
     def minutes_for_days_in_range(self, start, end):
         """
@@ -436,3 +458,33 @@ class SimulationParameters(object):
            emission_rate=self.emission_rate,
            first_open=self.first_open,
            last_close=self.last_close)
+
+
+def with_environment(asname='env'):
+    """
+    Decorator to automagically pass TradingEnvironment to the function
+    under the name asname. If the environment is passed explicitly as a keyword
+    then the explicitly passed value will be used instead.
+
+    usage:
+       with_environment()
+       def f(env=None):
+           pass
+
+       with_environment(asname='my_env')
+       def g(my_env=None):
+           pass
+    """
+    def with_environment_decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            # inject env into the namespace for the function.
+            # This doesn't use setdefault so that grabbing the trading env
+            # is lazy.
+            if asname not in kwargs:
+                kwargs[asname] = TradingEnvironment.instance()
+            return f(*args, **kwargs)
+
+        return wrapper
+
+    return with_environment_decorator

@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import datetime
 from datetime import timedelta
 from mock import MagicMock
+from nose_parameterized import parameterized
 from six.moves import range
+from textwrap import dedent
 from unittest import TestCase
 
 import numpy as np
@@ -34,6 +36,7 @@ from zipline.errors import (
     TradingControlViolation,
 )
 from zipline.test_algorithms import (
+    access_account_in_init,
     access_portfolio_in_init,
     AmbitiousStopLimitAlgorithm,
     EmptyPositionsAlgorithm,
@@ -66,7 +69,11 @@ from zipline.test_algorithms import (
     record_variables,
 )
 
-from zipline.utils.test_utils import drain_zipline, assert_single_position
+from zipline.utils.test_utils import (
+    assert_single_position,
+    drain_zipline,
+    to_utc,
+)
 
 from zipline.sources import (SpecificEquityTrades,
                              DataFrameSource,
@@ -77,6 +84,7 @@ from zipline.transforms import MovingAverage
 from zipline.finance.execution import LimitOrder
 from zipline.finance.trading import SimulationParameters
 from zipline.utils.api_support import set_algo_instance
+from zipline.utils.events import DateRuleFactory, TimeRuleFactory
 from zipline.algorithm import TradingAlgorithm
 
 
@@ -115,8 +123,12 @@ class TestMiscellaneousAPI(TestCase):
         setup_logger(self)
 
         sids = [1, 2]
-        self.sim_params = factory.create_simulation_parameters(num_days=2,
-                                                               sids=sids)
+        self.sim_params = factory.create_simulation_parameters(
+            num_days=2,
+            sids=sids,
+            data_frequency='minute',
+            emission_rate='minute',
+        )
         self.source = factory.create_minutely_trade_source(
             sids,
             trade_count=100,
@@ -173,6 +185,44 @@ class TestMiscellaneousAPI(TestCase):
                                 handle_data=handle_data,
                                 sim_params=self.sim_params)
         algo.run(self.source)
+
+    def test_schedule_function(self):
+        date_rules = DateRuleFactory
+        time_rules = TimeRuleFactory
+
+        def incrementer(algo, data):
+            algo.func_called += 1
+            self.assertEqual(
+                algo.get_datetime().time(),
+                datetime.time(hour=14, minute=31),
+            )
+
+        def initialize(algo):
+            algo.func_called = 0
+            algo.days = 1
+            algo.date = None
+            algo.schedule_function(
+                func=incrementer,
+                date_rule=date_rules.every_day(),
+                time_rule=time_rules.market_open(),
+            )
+
+        def handle_data(algo, data):
+            if not algo.date:
+                algo.date = algo.get_datetime().date()
+
+            if algo.date < algo.get_datetime().date():
+                algo.days += 1
+                algo.date = algo.get_datetime().date()
+
+        algo = TradingAlgorithm(
+            initialize=initialize,
+            handle_data=handle_data,
+            sim_params=self.sim_params,
+        )
+        algo.run(self.source)
+
+        self.assertEqual(algo.func_called, algo.days)
 
 
 class TestTransformAlgorithm(TestCase):
@@ -644,6 +694,24 @@ def handle_data(context, data):
 
         output, _ = drain_zipline(self, zipline)
 
+    def test_account_in_init(self):
+        """
+        Test that accessing account in init doesn't break.
+        """
+        test_algo = TradingAlgorithm(
+            script=access_account_in_init,
+            sim_params=self.sim_params,
+        )
+        set_algo_instance(test_algo)
+
+        self.zipline_test_config['algorithm'] = test_algo
+        self.zipline_test_config['trade_count'] = 1
+
+        zipline = simfactory.create_test_zipline(
+            **self.zipline_test_config)
+
+        output, _ = drain_zipline(self, zipline)
+
 
 class TestHistory(TestCase):
     def test_history(self):
@@ -665,6 +733,56 @@ def handle_data(context, data):
         algo = TradingAlgorithm(script=history_algo, sim_params=sim_params)
         output = algo.run(source)
         self.assertIsNot(output, None)
+
+
+class TestGetDatetime(TestCase):
+
+    @parameterized.expand(
+        [
+            ('default', None,),
+            ('utc', 'UTC',),
+            ('us_east', 'US/Eastern',),
+        ]
+    )
+    def test_get_datetime(self, name, tz):
+
+        algo = dedent(
+            """
+            import pandas as pd
+            from zipline.api import get_datetime
+
+            def initialize(context):
+                context.tz = {tz} or 'UTC'
+                context.first_bar = True
+
+            def handle_data(context, data):
+                if context.first_bar:
+                    dt = get_datetime({tz})
+                    if dt.tz.zone != context.tz:
+                        raise ValueError("Mismatched Zone")
+                    elif dt.tz_convert("US/Eastern").hour != 9:
+                        raise ValueError("Mismatched Hour")
+                    elif dt.tz_convert("US/Eastern").minute != 31:
+                        raise ValueError("Mismatched Minute")
+                context.first_bar = False
+            """.format(tz=repr(tz))
+        )
+
+        start = to_utc('2014-01-02 9:31')
+        end = to_utc('2014-01-03 9:31')
+        source = RandomWalkSource(
+            start=start,
+            end=end,
+        )
+        sim_params = factory.create_simulation_parameters(
+            data_frequency='minute'
+        )
+        algo = TradingAlgorithm(
+            script=algo,
+            sim_params=sim_params,
+        )
+        algo.run(source)
+        self.assertFalse(algo.first_bar)
 
 
 class TestTradingControls(TestCase):
@@ -840,7 +958,6 @@ class TestTradingControls(TestCase):
         self.check_algo_succeeds(algo, handle_data, order_count=20)
 
     def test_long_only(self):
-
         # Sell immediately -> fail immediately.
         def handle_data(algo, data):
             algo.order(self.sid, -1)
