@@ -5,26 +5,46 @@ object instead, one that not only has a string representation but some contextua
 "what kind of security is this?"
 """
 
+#from zipline.futures.symbol import Symbol
 class Symbol(str):
     def __new__(cls, base, asset_type="stock", month_code=None):
         """This override necessary so __init__ accepts a third parameter"""
-        return str.__new__(cls, base, month_code)
+        return str.__new__(cls, base)
 
-    def __init__(self, base, asset_type="stock"):
+    def __init__(self, base, asset_type="stock", month_code=None):
         """Possible values for asset_type: stock, underlying, contract"""
         self.asset_type = asset_type
+        self.month_code = month_code
         str.__init__(self, base)
 
     def __str__(self):
         return self
 
     def __add__(self, other):
-        # keep left asset type unless only the right object is a Symbol
-        return Symbol(str.__add__(self, other), self.asset_type)
+        # 3 scenarios:
+        #   1. symbol + string
+        #   2. symbol + symbol
+        #   3. string + symbol (__radd__ converts this to (1))
+        # In (1) and (3), we want to concatenate and keep the symbol's asset type and month code
+        # In (2), we want to keep the left symbol's asset type and month code; this is an arbitrary
+        #   decision, since there is no a priori way to know which asset info ought to be kept.
+        return Symbol(str.__add__(self, other), asset_type=self.asset_type, month_code=self.month_code)
+
+    def __repr__(self):
+        month_code_addendum = ", month code: " + self.month_code if self.asset_type == "contract" else ""
+        return Symbol.sadd("Symbol: ", self, ", asset type: ", self.asset_type, month_code_addendum)
 
     def __radd__(self, other):
         # invoked when adding string + symbol
-        return Symbol(other) + self
+        return Symbol(other, asset_type=self.asset_type, month_code=self.month_code) + self
+
+    @staticmethod
+    def sadd(*args):
+        # adds strings and symbols as strings, explicitly discarding asset types and month codes
+        result = ""
+        for arg in args:
+            result = str.__add__(result, arg)
+        return result
 
 """Test:
 
