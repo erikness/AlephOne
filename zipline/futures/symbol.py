@@ -5,7 +5,6 @@ object instead, one that not only has a string representation but some contextua
 "what kind of security is this?"
 """
 
-#from zipline.futures.symbol import Symbol
 class Symbol(str):
     def __new__(cls, base, asset_type="stock", month_code=None):
         """This override necessary so __init__ accepts a third parameter"""
