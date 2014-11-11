@@ -34,7 +34,6 @@ from zipline.errors import (
     UnsupportedCommissionModel,
     UnsupportedOrderParameters,
     UnsupportedSlippageModel,
-    IncompatibleScheduleFunctionDataFrequency,
 )
 
 from zipline.finance import trading
@@ -181,6 +180,9 @@ class TradingAlgorithm(object):
         self._portfolio = None
         self._account = None
 
+        self.history_container_class = kwargs.pop(
+            'history_container_class', HistoryContainer,
+        )
         self.history_container = None
         self.history_specs = {}
 
@@ -195,7 +197,9 @@ class TradingAlgorithm(object):
         self.event_manager = EventManager()
 
         if self.algoscript is not None:
-            exec_(self.algoscript, self.namespace)
+            filename = kwargs.pop('algo_filename', '<string>')
+            code = compile(self.algoscript, filename, 'exec')
+            exec_(code, self.namespace)
             self._initialize = self.namespace.get('initialize')
             if 'handle_data' not in self.namespace:
                 raise ValueError('You must define a handle_data function.')
@@ -235,6 +239,8 @@ class TradingAlgorithm(object):
         if 'data_frequency' in kwargs:
             self.data_frequency = kwargs.pop('data_frequency')
 
+        self._most_recent_data = None
+
         # Subclasses that override initialize should only worry about
         # setting self.initialized = True if AUTO_INITIALIZE is
         # is manually set to False.
@@ -258,6 +264,7 @@ class TradingAlgorithm(object):
         self._before_trading_start(self)
 
     def handle_data(self, data):
+        self._most_recent_data = data
         if self.history_container:
             self.history_container.update(data, self.datetime)
 
@@ -435,11 +442,13 @@ class TradingAlgorithm(object):
             self.sim_params._update_internal()
 
         # Create history containers
-        if len(self.history_specs) != 0:
-            self.history_container = HistoryContainer(
+        if self.history_specs:
+            self.history_container = self.history_container_class(
                 self.history_specs,
                 self.sim_params.sids,
-                self.sim_params.first_open)
+                self.sim_params.first_open,
+                self.sim_params.data_frequency,
+            )
 
         # Create transforms by wrapping them into StatefulTransforms
         self.transforms = []
@@ -535,11 +544,11 @@ class TradingAlgorithm(object):
         """
         Schedules a function to be called with some timed rules.
         """
-        if self.sim_params.data_frequency != 'minute':
-            raise IncompatibleScheduleFunctionDataFrequency()
-
         date_rule = date_rule or DateRuleFactory.every_day()
-        time_rule = time_rule or TimeRuleFactory.market_open()
+        time_rule = ((time_rule or TimeRuleFactory.market_open())
+                     if self.sim_params.data_frequency == 'minute' else
+                     # If we are in daily mode the time_rule is ignored.
+                     zipline.utils.events.Always())
 
         self.add_event(
             make_eventrule(date_rule, time_rule, half_days),
@@ -912,21 +921,57 @@ class TradingAlgorithm(object):
         self.blotter.cancel(order_id)
 
     @api_method
-    def add_history(self, bar_count, frequency, field,
-                    ffill=True):
+    def add_history(self, bar_count, frequency, field, ffill=True):
         data_frequency = self.sim_params.data_frequency
-        daily_at_midnight = (data_frequency == 'daily')
-
         history_spec = HistorySpec(bar_count, frequency, field, ffill,
-                                   daily_at_midnight=daily_at_midnight,
                                    data_frequency=data_frequency)
         self.history_specs[history_spec.key_str] = history_spec
+        if self.initialized:
+            if self.history_container:
+                self.history_container.ensure_spec(
+                    history_spec, self.datetime, self._most_recent_data,
+                )
+            else:
+                self.history_container = self.history_container_class(
+                    self.history_specs,
+                    self.current_universe(),
+                    self.sim_params.first_open,
+                    self.sim_params.data_frequency,
+                )
+
+    def get_history_spec(self, bar_count, frequency, field, ffill):
+        spec_key = HistorySpec.spec_key(bar_count, frequency, field, ffill)
+        if spec_key not in self.history_specs:
+            data_freq = self.sim_params.data_frequency
+            spec = HistorySpec(
+                bar_count,
+                frequency,
+                field,
+                ffill,
+                data_frequency=data_freq,
+            )
+            self.history_specs[spec_key] = spec
+            if not self.history_container:
+                self.history_container = self.history_container_class(
+                    self.history_specs,
+                    self.current_universe(),
+                    self.datetime,
+                    self.sim_params.data_frequency,
+                    bar_data=self._most_recent_data,
+                )
+            self.history_container.ensure_spec(
+                spec, self.datetime, self._most_recent_data,
+            )
+        return self.history_specs[spec_key]
 
     @api_method
     def history(self, bar_count, frequency, field, ffill=True):
-        spec_key_str = HistorySpec.spec_key(
-            bar_count, frequency, field, ffill)
-        history_spec = self.history_specs[spec_key_str]
+        history_spec = self.get_history_spec(
+            bar_count,
+            frequency,
+            field,
+            ffill,
+        )
         return self.history_container.get_history(history_spec, self.datetime)
 
     ####################
@@ -993,6 +1038,9 @@ class TradingAlgorithm(object):
         Set a rule specifying that this algorithm cannot take short positions.
         """
         self.register_trading_control(LongOnly())
+
+    def current_universe(self):
+        return self.sim_params.sids
 
     @classmethod
     def all_api_methods(cls):

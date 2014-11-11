@@ -69,6 +69,7 @@ from zipline.test_algorithms import (
     record_variables,
 )
 
+import zipline.utils.events
 from zipline.utils.test_utils import (
     assert_single_position,
     drain_zipline,
@@ -223,6 +224,41 @@ class TestMiscellaneousAPI(TestCase):
         algo.run(self.source)
 
         self.assertEqual(algo.func_called, algo.days)
+
+    @parameterized.expand([
+        ('daily',),
+        ('minute'),
+    ])
+    def test_schedule_funtion_rule_creation(self, mode):
+        nop = lambda *args, **kwargs: None
+
+        self.sim_params.data_frequency = mode
+        algo = TradingAlgorithm(
+            initialize=nop, handle_data=nop, sim_params=self.sim_params,
+        )
+
+        # Schedule something for NOT Always.
+        algo.schedule_function(nop, time_rule=zipline.utils.events.Never())
+
+        event_rule = algo.event_manager._events[1].rule
+
+        self.assertIsInstance(event_rule, zipline.utils.events.OncePerDay)
+
+        inner_rule = event_rule.rule
+        self.assertIsInstance(inner_rule, zipline.utils.events.ComposedRule)
+
+        first = inner_rule.first
+        second = inner_rule.second
+        composer = inner_rule.composer
+
+        self.assertIsInstance(first, zipline.utils.events.Always)
+
+        if mode == 'daily':
+            self.assertIsInstance(second, zipline.utils.events.Always)
+        else:
+            self.assertIsInstance(second, zipline.utils.events.Never)
+
+        self.assertIs(composer, zipline.utils.events.ComposedRule.lazy_and)
 
 
 class TestTransformAlgorithm(TestCase):
@@ -714,6 +750,18 @@ def handle_data(context, data):
 
 
 class TestHistory(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls._start = pd.Timestamp('1991-01-01', tz='UTC')
+        cls._end = pd.Timestamp('1991-01-15', tz='UTC')
+        cls.sim_params = factory.create_simulation_parameters(
+            data_frequency='minute',
+        )
+
+    @property
+    def source(self):
+        return RandomWalkSource(start=self._start, end=self._end)
+
     def test_history(self):
         history_algo = """
 from zipline.api import history, add_history
@@ -724,15 +772,41 @@ def initialize(context):
 def handle_data(context, data):
     df = history(10, '1d', 'price')
 """
-        start = pd.Timestamp('1991-01-01', tz='UTC')
-        end = pd.Timestamp('1991-01-15', tz='UTC')
-        source = RandomWalkSource(start=start,
-                                  end=end)
-        sim_params = factory.create_simulation_parameters(
-            data_frequency='minute')
-        algo = TradingAlgorithm(script=history_algo, sim_params=sim_params)
-        output = algo.run(source)
+
+        algo = TradingAlgorithm(
+            script=history_algo,
+            sim_params=self.sim_params,
+        )
+        output = algo.run(self.source)
         self.assertIsNot(output, None)
+
+    def test_history_without_add(self):
+        def handle_data(algo, data):
+            algo.history(1, '1m', 'price')
+
+        algo = TradingAlgorithm(
+            initialize=lambda _: None,
+            handle_data=handle_data,
+            sim_params=self.sim_params,
+        )
+        algo.run(self.source)
+
+        self.assertIsNotNone(algo.history_container)
+        self.assertEqual(algo.history_container.buffer_panel.window_length, 1)
+
+    def test_add_history_in_handle_data(self):
+        def handle_data(algo, data):
+            algo.add_history(1, '1m', 'price')
+
+        algo = TradingAlgorithm(
+            initialize=lambda _: None,
+            handle_data=handle_data,
+            sim_params=self.sim_params,
+        )
+        algo.run(self.source)
+
+        self.assertIsNotNone(algo.history_container)
+        self.assertEqual(algo.history_container.buffer_panel.window_length, 1)
 
 
 class TestGetDatetime(TestCase):
