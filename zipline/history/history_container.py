@@ -230,7 +230,7 @@ class HistoryContainer(object):
 
         # Dictionaries with Frequency objects as keys.
         self.digest_panels, self.cur_window_starts, self.cur_window_closes = \
-            self.create_digest_panels(initial_sids, initial_dt, bar_data)
+            self.create_digest_panels(initial_sids, initial_dt)
 
         # Helps prop up the prior day panel against having a nan, when the data
         # has been seen.
@@ -387,24 +387,15 @@ class HistoryContainer(object):
         """
         # This is the oldest datetime that will be shown in the current window
         # of the panel.
-        oldest_idx = panel._oldest_frame_idx
-        oldest_dt = pd.Timestamp(
-            panel.date_buf[oldest_idx], tz='utc',
-        )
-        old_cap = panel.cap
-        panel.resize(size)
+        oldest_dt = pd.Timestamp(panel.start_date, tz='utc',)
+        delta = size - panel.window_length
 
-        delta = (old_cap - oldest_idx) - panel._oldest_frame_idx
-
-        # Backfill the missing dates of the new current window.
+        # Construct the missing dates.
         missing_dts = self._create_window_date_buf(
             delta, freq.unit_str, freq.data_frequency, oldest_dt,
         )
 
-        # Fill the dates in between the new oldest index and adjusted oldest
-        # index.
-        where = slice(panel._oldest_frame_idx, -(old_cap - oldest_idx))
-        panel.date_buf[where] = missing_dts
+        panel.extend_back(missing_dts)
 
     @with_environment()
     def _create_window_date_buf(self,
@@ -448,24 +439,19 @@ class HistoryContainer(object):
 
         window = spec.bar_count - 1
 
-        # everything after dt is going to be filled from calling update, no
-        # need to precompute these dates.
-        second = np.empty(window, dtype='datetime64[ns]')
-        date_buf = np.hstack(
-            (self._create_window_date_buf(
-                window,
-                spec.frequency.unit_str,
-                spec.frequency.data_frequency,
-                dt,
-                env=env,
-            ), second),
+        date_buf = self._create_window_date_buf(
+            window,
+            spec.frequency.unit_str,
+            spec.frequency.data_frequency,
+            dt,
+            env=env,
         )
 
         panel = RollingPanel(
             window=window,
             items=self.fields,
             sids=self.sids,
-            date_buf=date_buf,
+            initial_dates=date_buf,
         )
 
         return panel
@@ -551,7 +537,6 @@ class HistoryContainer(object):
     def create_digest_panels(self,
                              initial_sids,
                              initial_dt,
-                             bar_data,
                              env=None):
         """
         Initialize a RollingPanel for each unique panel frequency being stored
@@ -578,8 +563,6 @@ class HistoryContainer(object):
                 continue
 
             dt = initial_dt
-            if bar_data is not None:
-                dt = largest_spec.frequency.prev_bar(dt)
 
             rp = self._create_digest_panel(
                 dt,
