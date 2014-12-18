@@ -23,7 +23,11 @@ from datetime import datetime
 
 from itertools import groupby, chain
 from six.moves import filter
-from six import iteritems, exec_
+from six import (
+    exec_,
+    iteritems,
+    string_types,
+)
 from operator import attrgetter
 
 from zipline.errors import (
@@ -148,7 +152,7 @@ class TradingAlgorithm(object):
         self._recorded_vars = {}
         self.namespace = kwargs.get('namespace', {})
 
-        self._environment = kwargs.pop('environment', 'zipline')
+        self._platform = kwargs.pop('platform', 'zipline')
 
         self.logger = None
 
@@ -545,8 +549,19 @@ class TradingAlgorithm(object):
             self.add_history(bars, freq, 'volume')
 
     @api_method
-    def get_environment(self):
-        return self._environment
+    def get_environment(self, field='platform'):
+        env = {
+            'arena': self.sim_params.arena,
+            'data_frequency': self.sim_params.data_frequency,
+            'start': self.sim_params.first_open,
+            'end': self.sim_params.last_close,
+            'capital_base': self.sim_params.capital_base,
+            'platform': self._platform
+        }
+        if field == '*':
+            return env
+        else:
+            return env[field]
 
     def add_event(self, rule=None, callback=None):
         """
@@ -784,7 +799,9 @@ class TradingAlgorithm(object):
         assert date_copy.tzinfo == pytz.utc, \
             "Algorithm should have a utc datetime"
         if tz is not None:
-            date_copy = date_copy.tz_convert(tz)
+            if isinstance(tz, string_types):
+                tz = pytz.timezone(tz)
+            date_copy = date_copy.astimezone(tz)
         return date_copy
 
     def set_transact(self, transact):

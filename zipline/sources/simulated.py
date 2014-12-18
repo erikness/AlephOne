@@ -18,6 +18,7 @@ import six
 
 import numpy as np
 from datetime import timedelta
+import pandas as pd
 
 from zipline.sources.data_source import DataSource
 from zipline.utils import tradingcalendar as calendar_nyse
@@ -34,7 +35,7 @@ class RandomWalkSource(DataSource):
     VALID_FREQS = frozenset(('daily', 'minute'))
 
     def __init__(self, start_prices=None, freq='minute', start=None,
-                 end=None, calendar=calendar_nyse):
+                 end=None, drift=0.1, sd=0.1, calendar=calendar_nyse):
         """
         :Arguments:
             start_prices : dict
@@ -47,6 +48,10 @@ class RandomWalkSource(DataSource):
                  Start dt to emit events.
             end : datetime <default=end of calendar>
                  End dt until to which emit events.
+            drift: float <default=0.1>
+                 Constant drift of the price series.
+            sd: float <default=0.1>
+                 Standard deviation of the price series.
             calendar : calendar object <default: NYSE>
                  Calendar to use.
                  See zipline.utils for different choices.
@@ -83,8 +88,8 @@ class RandomWalkSource(DataSource):
         else:
             self.end = end
 
-        self.drift = .1
-        self.sd = .1
+        self.drift = drift
+        self.sd = sd
 
         self.sids = self.start_prices.keys()
 
@@ -141,7 +146,8 @@ class RandomWalkSource(DataSource):
                     current_dt += timedelta(minutes=1)
             elif self.freq == 'daily':
                 # Emit one signal per day at close
-                for event in self._gen_events(cur_prices, close_dt):
+                for event in self._gen_events(
+                        cur_prices, pd.tslib.normalize_date(close_dt)):
                     yield event
 
     @property
