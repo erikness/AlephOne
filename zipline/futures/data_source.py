@@ -91,7 +91,7 @@ def fill_nans(panel):
     for symbol, frame in panel.iteritems():
         und, month_code = symbol.split('.')
         # volume
-        frame['volume'] = frame['volume'].replace(nan, 0)
+        frame['volume'] = frame['volume'].replace(float("nan"), 0)
         # price
         frame['price'] = frame['price'].ffill()
         if np.isnan(frame.ix[0]['price']):
